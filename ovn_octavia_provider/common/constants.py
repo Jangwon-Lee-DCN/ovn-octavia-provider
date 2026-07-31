@@ -42,6 +42,7 @@ LB_EXT_IDS_LS_REFS_KEY = 'ls_refs'
 LB_EXT_IDS_LR_REF_KEY = 'lr_ref'
 LB_RETURN_POLICY_PRIORITY = 31000
 LB_RETURN_POLICY_OWNER_KEY = 'octavia:cross_router_lb'
+LB_RETURN_ROUTE_OWNER_KEY = 'octavia:cross_router_lb_route'
 LB_EXT_IDS_POOL_PREFIX = 'pool_'
 LB_EXT_IDS_LISTENER_PREFIX = 'listener_'
 LB_EXT_IDS_MEMBER_PREFIX = 'member_'

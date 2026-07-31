@@ -17,11 +17,16 @@ The provider now:
   toward the VIP;
 - installs a priority-31000 source/service reroute policy for a remote
   member;
-- records load-balancer/member ownership in policy `external_ids`;
+- installs a member-address `/32` (IPv4) or `/128` (IPv6)
+  `policy=src-ip` route toward the selected transit next hop. This
+  supplies the return route when a TransitGateway-attached member
+  router intentionally has no default route;
+- records load-balancer/member ownership in both policy and route
+  `external_ids`;
 - safely shares an identical policy and refuses to overwrite an
-  unmanaged or conflicting policy;
-- removes ownership during member deletion and restores missing policy
-  state during member synchronization.
+  unmanaged or conflicting policy/route;
+- removes ownership and the final route during member deletion, and
+  restores missing state during member synchronization.
 
 The runtime overlay image can be built on the exact Octavia image used
 by a deployment:
@@ -38,6 +43,21 @@ produced 16 successful HTTP requests and 14 timeouts. With the managed
 return policy, 30 of 30 requests succeeded across both real VM
 backends. Member deletion removed the policy and member recreation
 restored it.
+
+An additional controller-managed TransitGateway test used two Keystone
+projects, two real HTTP VMs, one attachment per VPC, and a cross-project
+Octavia member. A reroute policy alone produced an empty `nexthops`
+column first (the provider used the wrong OVSDB field) and, after that
+was corrected, still lost the remote member's SYN-ACK because its router
+had no default route. The source-policy host route fixed that narrower
+case: 40/40 requests succeeded (22 local, 18 remote), deletion removed
+the route, and recreation restored it with a new member owner; a second
+20/20 request run succeeded (11 local, 9 remote).
+
+Whole-load-balancer deletion is covered separately from member deletion:
+it removes every ownership token for that LB before detaching/deleting
+the OVN load balancer. The live cascade test left zero matching source
+routes.
 
 This is a downstream compatibility patch and has not been accepted
 upstream.

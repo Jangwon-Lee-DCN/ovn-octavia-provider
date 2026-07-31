@@ -834,6 +834,8 @@ class OvnProviderHelper():
             f"{protocol}.src == {member[constants.PROTOCOL_PORT]}"
         )
         owner = f"{ovn_lb.name}:{member[constants.ID]}"
+        self._cross_router_member_source_route(
+            ovn_lr, member[constants.ADDRESS], nexthop, owner, delete)
         existing = next(
             (policy for policy in ovn_lr.policies
              if (policy.priority == ovn_const.LB_RETURN_POLICY_PRIORITY and
@@ -886,11 +888,123 @@ class OvnProviderHelper():
             else:
                 command = self.ovn_nbdb_api.lr_policy_add(
                     ovn_lr.uuid, ovn_const.LB_RETURN_POLICY_PRIORITY,
-                    match, 'reroute', nexthop=nexthop,
+                    match, 'reroute', nexthops=[nexthop],
                     external_ids={
                         ovn_const.LB_RETURN_POLICY_OWNER_KEY: owner,
                     })
         command.execute(check_error=True)
+
+    def _cross_router_member_source_route(self, ovn_lr, address, nexthop,
+                                          owner, delete=False):
+        """Keep replies from one member on the VIP router path.
+
+        A reroute policy is not sufficient for routed OVN LB replies when the
+        member router has no default route (the TransitGateway case): the
+        SYN-ACK reaches the member but is dropped after leaving it.  OVN's
+        source-policy static route enters the normal route/undnat pipeline and
+        preserves the VIP router's connection-tracking path without changing
+        the default route for the rest of the member VPC.
+        """
+        address = netaddr.IPAddress(address)
+        prefix = f"{address}/{32 if address.version == 4 else 128}"
+        owner_key = ovn_const.LB_RETURN_ROUTE_OWNER_KEY
+
+        def is_source_route(route):
+            policy = getattr(route, 'policy', None)
+            if isinstance(policy, (list, tuple)):
+                policy = policy[0] if policy else None
+            return route.ip_prefix == prefix and policy == 'src-ip'
+
+        existing = next(
+            (route for route in ovn_lr.static_routes
+             if is_source_route(route)),
+            None)
+        if delete:
+            if not existing:
+                return
+            owners = set(
+                existing.external_ids.get(owner_key, '').split(','))
+            owners.discard('')
+            if owner not in owners:
+                return
+            owners.remove(owner)
+            if owners:
+                self.ovn_nbdb_api.db_set(
+                    'Logical_Router_Static_Route', existing.uuid,
+                    ('external_ids', {
+                        owner_key: ','.join(sorted(owners)),
+                    })).execute(check_error=True)
+            else:
+                self.ovn_nbdb_api.lr_route_del(
+                    ovn_lr.uuid, prefix, nexthop=existing.nexthop,
+                    if_exists=True).execute(check_error=True)
+            return
+
+        if existing:
+            owners = set(
+                existing.external_ids.get(owner_key, '').split(','))
+            owners.discard('')
+            if not owners or existing.nexthop != nexthop:
+                raise driver_exceptions.DriverError(
+                    user_fault_string=_(
+                        "Conflicting source route for routed load balancer "
+                        "member"),
+                    operator_fault_string=_(
+                        "Refusing to overwrite unmanaged or conflicting "
+                        "logical router source route"))
+            owners.add(owner)
+            self.ovn_nbdb_api.db_set(
+                'Logical_Router_Static_Route', existing.uuid,
+                ('external_ids', {
+                    owner_key: ','.join(sorted(owners)),
+                })).execute(check_error=True)
+            return
+
+        route = self.ovn_nbdb_api.lr_route_add(
+            ovn_lr.uuid, prefix, nexthop, policy='src-ip')
+        route_row = route.execute(check_error=True)
+        route_id = getattr(route_row, 'uuid', route_row)
+        self.ovn_nbdb_api.db_set(
+            'Logical_Router_Static_Route', route_id,
+            ('external_ids', {owner_key: owner})).execute(check_error=True)
+
+    def _cleanup_cross_router_lb_state(self, ovn_lb):
+        """Remove this LB's ownership when Octavia deletes it as a whole."""
+        owner_prefix = f'{ovn_lb.name}:'
+        for ovn_lr in self._find_lb_in_table(ovn_lb, 'Logical_Router'):
+            for row, table, owner_key in (
+                    *((policy, 'Logical_Router_Policy',
+                       ovn_const.LB_RETURN_POLICY_OWNER_KEY)
+                      for policy in ovn_lr.policies),
+                    *((route, 'Logical_Router_Static_Route',
+                       ovn_const.LB_RETURN_ROUTE_OWNER_KEY)
+                      for route in ovn_lr.static_routes)):
+                owners = {
+                    owner for owner in
+                    row.external_ids.get(owner_key, '').split(',')
+                    if owner
+                }
+                owned = {
+                    owner for owner in owners
+                    if owner.startswith(owner_prefix)
+                }
+                if not owned:
+                    continue
+                remaining = owners - owned
+                if remaining:
+                    self.ovn_nbdb_api.db_set(
+                        table, row.uuid,
+                        ('external_ids', {
+                            owner_key: ','.join(sorted(remaining)),
+                        })).execute(check_error=True)
+                elif table == 'Logical_Router_Policy':
+                    self.ovn_nbdb_api.lr_policy_del(
+                        ovn_lr.uuid, row.priority, row.match,
+                        if_exists=True).execute(check_error=True)
+                else:
+                    self.ovn_nbdb_api.lr_route_del(
+                        ovn_lr.uuid, row.ip_prefix, nexthop=row.nexthop,
+                        if_exists=True).execute(check_error=True)
 
     def _lb_status(self, loadbalancer, provisioning_status, operating_status):
         """Return status for the LoadBalancer."""
@@ -1913,6 +2027,7 @@ class OvnProviderHelper():
         commands = []
         member_subnets = []
         clean_up_hm_port_required = False
+        self._cleanup_cross_router_lb_state(ovn_lb)
         if loadbalancer['cascade']:
             # Delete all pools
             for key, value in ovn_lb.external_ids.items():

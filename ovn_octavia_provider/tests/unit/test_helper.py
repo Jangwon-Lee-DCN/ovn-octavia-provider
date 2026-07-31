@@ -2521,6 +2521,8 @@ class TestOvnProviderHelper(ovn_base.TestOvnOctaviaBase):
         self.ovn_lb.external_ids[ovn_const.LB_EXT_IDS_LR_REF_KEY] = (
             f'{vip_router},{member_router.name}')
         policy = self.helper.ovn_nbdb_api.lr_policy_add.return_value
+        route = self.helper.ovn_nbdb_api.lr_route_add.return_value
+        route.execute.return_value = mock.Mock(uuid='source-route-uuid')
 
         self.helper._cross_router_member_policy(
             self.member, self.ovn_lb, member_router)
@@ -2529,11 +2531,20 @@ class TestOvnProviderHelper(ovn_base.TestOvnOctaviaBase):
             member_router.uuid, ovn_const.LB_RETURN_POLICY_PRIORITY,
             f'ip4.src == {self.member_address} && '
             f'tcp.src == {self.member_port}',
-            'reroute', nexthop='172.31.250.2',
+            'reroute', nexthops=['172.31.250.2'],
             external_ids={
                 ovn_const.LB_RETURN_POLICY_OWNER_KEY:
                     f'{self.loadbalancer_id}:{self.member_id}',
             })
+        self.helper.ovn_nbdb_api.lr_route_add.assert_called_once_with(
+            member_router.uuid, f'{self.member_address}/32',
+            '172.31.250.2', policy='src-ip')
+        self.helper.ovn_nbdb_api.db_set.assert_any_call(
+            'Logical_Router_Static_Route', 'source-route-uuid',
+            ('external_ids', {
+                ovn_const.LB_RETURN_ROUTE_OWNER_KEY:
+                    f'{self.loadbalancer_id}:{self.member_id}',
+            }))
         policy.execute.assert_called_once_with(check_error=True)
 
     def test_cross_router_member_policy_delete(self):
@@ -2606,7 +2617,7 @@ class TestOvnProviderHelper(ovn_base.TestOvnOctaviaBase):
         self.helper._cross_router_member_policy(
             self.member, self.ovn_lb, member_router)
 
-        self.helper.ovn_nbdb_api.db_set.assert_called_once_with(
+        self.helper.ovn_nbdb_api.db_set.assert_any_call(
             'Logical_Router_Policy', policy_row.uuid,
             ('external_ids', {
                 ovn_const.LB_RETURN_POLICY_OWNER_KEY:
@@ -2615,7 +2626,9 @@ class TestOvnProviderHelper(ovn_base.TestOvnOctaviaBase):
                         f'{self.loadbalancer_id}:{self.member_id}',
                     ])),
             }))
-        command.execute.assert_called_once_with(check_error=True)
+        self.assertEqual(
+            2, command.execute.call_count,
+            'source-route and shared-policy ownership updates must commit')
         self.helper.ovn_nbdb_api.lr_policy_add.assert_not_called()
 
     def test_cross_router_member_policy_refuses_unmanaged_collision(self):
