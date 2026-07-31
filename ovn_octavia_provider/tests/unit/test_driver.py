@@ -2353,6 +2353,26 @@ class TestOvnProviderDriver(ovn_base.TestOvnOctaviaBase):
             self.driver.do_sync(**lb_filters)
             mock_ensure_lb.assert_not_called()
 
+    @mock.patch.object(clients, 'get_octavia_client')
+    def test_do_sync_by_id_does_not_list_all_loadbalancers(
+            self, mock_get_octavia_client):
+        lb = mock.MagicMock(id=self.ref_lb_fully_sync_populated.name,
+                            provider='ovn')
+        octavia_client = mock_get_octavia_client.return_value
+        octavia_client.get_load_balancer.return_value = lb
+        with mock.patch.object(
+                self.driver._ovn_helper, 'get_octavia_lbs') as mock_list, \
+                mock.patch.object(
+                    self.driver._ovn_helper._octavia_driver_lib,
+                    'get_loadbalancer',
+                    return_value=self.ref_lb_fully_sync_populated), \
+                mock.patch.object(self.driver, '_ensure_loadbalancer'), \
+                mock.patch.object(self.driver, '_fip_sync'):
+            self.driver.do_sync(id=lb.id, provider='ovn')
+
+        octavia_client.get_load_balancer.assert_called_once_with(lb.id)
+        mock_list.assert_not_called()
+
     @mock.patch.object(data_models.HealthMonitor, 'from_dict')
     @mock.patch.object(data_models.Member, 'from_dict')
     @mock.patch.object(data_models.Listener, 'from_dict')

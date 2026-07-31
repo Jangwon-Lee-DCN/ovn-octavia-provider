@@ -901,8 +901,19 @@ class OvnProviderDriver(driver_base.ProviderDriver):
     def do_sync(self, **lb_filters):
         LOG.info(f"Starting sync OVN DB with Loadbalancer filter {lb_filters}")
         octavia_client = clients.get_octavia_client()
-        # We can add project_id to lb_filters for lbs to limit the scope.
-        lbs = self._ovn_helper.get_octavia_lbs(octavia_client, **lb_filters)
+        # LoadBalancer's OpenStackSDK query mapping does not include ``id``;
+        # passing it to ``load_balancers`` silently drops the filter and can
+        # turn an intended single-LB repair into a full provider sync. Use the
+        # resource GET operation for targeted recovery instead.
+        lb_id = lb_filters.pop('id', None)
+        if lb_id:
+            lb = octavia_client.get_load_balancer(lb_id)
+            provider = lb_filters.get('provider')
+            lbs = [lb] if not provider or lb.provider == provider else []
+        else:
+            # We can add project_id to lb_filters for lbs to limit the scope.
+            lbs = self._ovn_helper.get_octavia_lbs(
+                octavia_client, **lb_filters)
         for lb in lbs:
             LOG.info(f"Starting sync OVN DB with Loadbalancer {lb.name}")
             provider_lb = (
