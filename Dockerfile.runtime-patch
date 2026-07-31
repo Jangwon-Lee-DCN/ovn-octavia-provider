@@ -1,0 +1,12 @@
+ARG OCTAVIA_BASE_IMAGE
+FROM ${OCTAVIA_BASE_IMAGE}
+
+USER root
+COPY ovn_octavia_provider/helper.py /var/lib/openstack/lib/python3.12/site-packages/ovn_octavia_provider/helper.py
+COPY ovn_octavia_provider/common/constants.py /var/lib/openstack/lib/python3.12/site-packages/ovn_octavia_provider/common/constants.py
+COPY ovn_octavia_provider/ovsdb/impl_idl_ovn.py /var/lib/openstack/lib/python3.12/site-packages/ovn_octavia_provider/ovsdb/impl_idl_ovn.py
+RUN chown 42424:42424 \
+    /var/lib/openstack/lib/python3.12/site-packages/ovn_octavia_provider/helper.py \
+    /var/lib/openstack/lib/python3.12/site-packages/ovn_octavia_provider/common/constants.py \
+    /var/lib/openstack/lib/python3.12/site-packages/ovn_octavia_provider/ovsdb/impl_idl_ovn.py
+USER 42424

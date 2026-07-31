@@ -782,6 +782,116 @@ class OvnProviderHelper():
         except (idlutils.RowNotFound, openstack.exceptions.ResourceNotFound):
             return None
 
+    def _cross_router_member_policy(self, member, ovn_lb, ovn_lr,
+                                    delete=False):
+        """Keep a routed member's reply on the VIP router path.
+
+        OVN associates a routed member's load balancer with both logical
+        routers, but a member router with its own default gateway can send the
+        reply away from the VIP router's un-DNAT context.  Select the most
+        specific route from the member router back to the VIP and install a
+        narrowly-scoped source/service policy toward that next hop.
+        """
+        if not ovn_lr:
+            return
+        lr_refs = [
+            value.strip() for value in
+            ovn_lb.external_ids.get(
+                ovn_const.LB_EXT_IDS_LR_REF_KEY, '').split(',')
+            if value.strip()
+        ]
+        LOG.info(
+            "Evaluating routed member policy for load balancer %(lb)s, "
+            "member router %(router)s, router references %(refs)s",
+            {'lb': ovn_lb.name, 'router': ovn_lr.name, 'refs': lr_refs})
+        if not lr_refs or ovn_lr.name == lr_refs[0]:
+            return
+
+        vip = netaddr.IPAddress(
+            ovn_lb.external_ids[ovn_const.LB_EXT_IDS_VIP_KEY])
+        routes = []
+        for route in ovn_lr.static_routes:
+            network = netaddr.IPNetwork(route.ip_prefix)
+            # A default route points at the member router's external gateway,
+            # which is the asymmetric path this policy must avoid.
+            if vip in network and network.prefixlen:
+                routes.append((network.prefixlen, route.nexthop))
+        if not routes:
+            LOG.warning(
+                "No return route from member router %(router)s to VIP %(vip)s",
+                {'router': ovn_lr.name, 'vip': str(vip)})
+            return
+        nexthop = max(routes, key=lambda candidate: candidate[0])[1]
+
+        if not ovn_lb.protocol:
+            return
+        protocol = str(ovn_lb.protocol[0]).lower()
+        if protocol not in ('tcp', 'udp', 'sctp'):
+            return
+        ip_family = 'ip4' if vip.version == 4 else 'ip6'
+        match = (
+            f"{ip_family}.src == {member[constants.ADDRESS]} && "
+            f"{protocol}.src == {member[constants.PROTOCOL_PORT]}"
+        )
+        owner = f"{ovn_lb.name}:{member[constants.ID]}"
+        existing = next(
+            (policy for policy in ovn_lr.policies
+             if (policy.priority == ovn_const.LB_RETURN_POLICY_PRIORITY and
+                 policy.match == match)),
+            None)
+        if delete:
+            if not existing:
+                return
+            owners = set(existing.external_ids.get(
+                ovn_const.LB_RETURN_POLICY_OWNER_KEY, '').split(','))
+            owners.discard('')
+            if owner not in owners:
+                return
+            owners.remove(owner)
+            if owners:
+                command = self.ovn_nbdb_api.db_set(
+                    'Logical_Router_Policy', existing.uuid,
+                    ('external_ids', {
+                        ovn_const.LB_RETURN_POLICY_OWNER_KEY:
+                            ','.join(sorted(owners)),
+                    }))
+            else:
+                command = self.ovn_nbdb_api.lr_policy_del(
+                    ovn_lr.uuid, ovn_const.LB_RETURN_POLICY_PRIORITY,
+                    match, if_exists=True)
+        else:
+            if existing:
+                owners = set(existing.external_ids.get(
+                    ovn_const.LB_RETURN_POLICY_OWNER_KEY, '').split(','))
+                owners.discard('')
+                existing_nexthops = set(
+                    getattr(existing, 'nexthops', []) or
+                    getattr(existing, 'nexthop', []))
+                if (not owners or existing.action != 'reroute' or
+                        nexthop not in existing_nexthops):
+                    raise driver_exceptions.DriverError(
+                        user_fault_string=_(
+                            "Conflicting logical router policy for routed "
+                            "load balancer member"),
+                        operator_fault_string=_(
+                            "Refusing to overwrite unmanaged or conflicting "
+                            "logical router policy"))
+                owners.add(owner)
+                command = self.ovn_nbdb_api.db_set(
+                    'Logical_Router_Policy', existing.uuid,
+                    ('external_ids', {
+                        ovn_const.LB_RETURN_POLICY_OWNER_KEY:
+                            ','.join(sorted(owners)),
+                    }))
+            else:
+                command = self.ovn_nbdb_api.lr_policy_add(
+                    ovn_lr.uuid, ovn_const.LB_RETURN_POLICY_PRIORITY,
+                    match, 'reroute', nexthop=nexthop,
+                    external_ids={
+                        ovn_const.LB_RETURN_POLICY_OWNER_KEY: owner,
+                    })
+        command.execute(check_error=True)
+
     def _lb_status(self, loadbalancer, provisioning_status, operating_status):
         """Return status for the LoadBalancer."""
         return {
@@ -2640,6 +2750,7 @@ class OvnProviderHelper():
 
         if ovn_lr:
             self._sync_lb_to_lr_association(ovn_lb, ovn_lr)
+            self._cross_router_member_policy(member, ovn_lb, ovn_lr)
 
         # TODO(froyo): Check if originally status in Octavia is ERROR if
         # we receive that info from the object
@@ -2685,19 +2796,7 @@ class OvnProviderHelper():
         # are associated with the load balancer. This is needed to handle
         # potential race that happens when lrp and lb are created at the
         # same time.
-        neutron_client = clients.get_neutron_client()
-        ovn_lr = None
-        try:
-            subnet = neutron_client.get_subnet(subnet_id)
-            ls_name = utils.ovn_name(subnet.network_id)
-            ovn_ls = self.ovn_nbdb_api.ls_get(ls_name).execute(
-                check_error=True)
-            ovn_lr = self._find_lr_of_ls(
-                ovn_ls, subnet.gateway_ip)
-        except openstack.exceptions.ResourceNotFound:
-            pass
-        except idlutils.RowNotFound:
-            pass
+        ovn_lr = self._get_related_lr(member)
 
         if ovn_lr:
             try:
@@ -2707,6 +2806,7 @@ class OvnProviderHelper():
                             "logical router %s failed, trying step by step",
                             ovn_lb.uuid, ovn_lr.uuid)
                 self._update_lb_to_lr_association_by_step(ovn_lb, ovn_lr)
+            self._cross_router_member_policy(member, ovn_lb, ovn_lr)
 
         return member_info
 
@@ -2771,6 +2871,16 @@ class OvnProviderHelper():
         existing_members = external_ids[pool_key].split(",")
         member_info = self._get_member_info(member)
         if member_info in existing_members:
+            try:
+                ovn_lr = self._get_related_lr(member)
+                self._cross_router_member_policy(
+                    member, ovn_lb, ovn_lr, delete=True)
+            except (driver_exceptions.DriverError,
+                    openstack.exceptions.OpenStackCloudException) as exc:
+                # A stale return policy is preferable to making an otherwise
+                # valid Octavia member deletion impossible. Reconciliation
+                # can remove it after Neutron connectivity recovers.
+                LOG.warning("Unable to remove routed member policy: %s", exc)
 
             if ovn_lb.health_check:
                 self._update_hm_member(ovn_lb,

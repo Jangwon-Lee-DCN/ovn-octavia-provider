@@ -2507,6 +2507,155 @@ class TestOvnProviderHelper(ovn_base.TestOvnOctaviaBase):
         self.helper.ovn_nbdb_api.db_set.assert_has_calls(
             expected_calls)
 
+    def test_cross_router_member_policy_add(self):
+        vip_router = 'neutron-vip-router'
+        member_router = mock.MagicMock()
+        member_router.name = 'neutron-member-router'
+        member_router.uuid = 'member-router-uuid'
+        member_router.policies = []
+        member_router.static_routes = [
+            mock.Mock(ip_prefix='0.0.0.0/0', nexthop='192.0.2.1'),
+            mock.Mock(ip_prefix='10.22.33.0/24', nexthop='172.31.250.2'),
+        ]
+        self.ovn_lb.name = self.loadbalancer_id
+        self.ovn_lb.external_ids[ovn_const.LB_EXT_IDS_LR_REF_KEY] = (
+            f'{vip_router},{member_router.name}')
+        policy = self.helper.ovn_nbdb_api.lr_policy_add.return_value
+
+        self.helper._cross_router_member_policy(
+            self.member, self.ovn_lb, member_router)
+
+        self.helper.ovn_nbdb_api.lr_policy_add.assert_called_once_with(
+            member_router.uuid, ovn_const.LB_RETURN_POLICY_PRIORITY,
+            f'ip4.src == {self.member_address} && '
+            f'tcp.src == {self.member_port}',
+            'reroute', nexthop='172.31.250.2',
+            external_ids={
+                ovn_const.LB_RETURN_POLICY_OWNER_KEY:
+                    f'{self.loadbalancer_id}:{self.member_id}',
+            })
+        policy.execute.assert_called_once_with(check_error=True)
+
+    def test_cross_router_member_policy_delete(self):
+        member_router = mock.MagicMock()
+        member_router.name = 'neutron-member-router'
+        member_router.uuid = 'member-router-uuid'
+        policy_row = mock.Mock(
+            priority=ovn_const.LB_RETURN_POLICY_PRIORITY,
+            match=f'ip4.src == {self.member_address} && '
+                  f'tcp.src == {self.member_port}',
+            external_ids={
+                ovn_const.LB_RETURN_POLICY_OWNER_KEY:
+                    f'{self.ovn_lb.name}:{self.member_id}',
+            })
+        member_router.policies = [policy_row]
+        member_router.static_routes = [
+            mock.Mock(ip_prefix='10.22.33.0/24',
+                      nexthop='172.31.250.2')]
+        self.ovn_lb.external_ids[ovn_const.LB_EXT_IDS_LR_REF_KEY] = (
+            f'neutron-vip-router,{member_router.name}')
+        policy = self.helper.ovn_nbdb_api.lr_policy_del.return_value
+
+        self.helper._cross_router_member_policy(
+            self.member, self.ovn_lb, member_router, delete=True)
+
+        self.helper.ovn_nbdb_api.lr_policy_del.assert_called_once_with(
+            member_router.uuid, ovn_const.LB_RETURN_POLICY_PRIORITY,
+            f'ip4.src == {self.member_address} && '
+            f'tcp.src == {self.member_port}',
+            if_exists=True)
+        policy.execute.assert_called_once_with(check_error=True)
+
+    def test_cross_router_member_policy_skips_vip_router(self):
+        member_router = mock.MagicMock()
+        member_router.name = 'neutron-vip-router'
+        member_router.policies = []
+        self.ovn_lb.external_ids[ovn_const.LB_EXT_IDS_LR_REF_KEY] = (
+            member_router.name)
+
+        self.helper._cross_router_member_policy(
+            self.member, self.ovn_lb, member_router)
+
+        self.helper.ovn_nbdb_api.lr_policy_add.assert_not_called()
+
+    def test_cross_router_member_policy_shares_owned_policy(self):
+        owner = f'other-lb:{uuidutils.generate_uuid()}'
+        match = (f'ip4.src == {self.member_address} && '
+                 f'tcp.src == {self.member_port}')
+        policy_row = mock.Mock(
+            uuid='policy-uuid',
+            priority=ovn_const.LB_RETURN_POLICY_PRIORITY,
+            match=match,
+            action='reroute',
+            nexthops=['172.31.250.2'],
+            external_ids={
+                ovn_const.LB_RETURN_POLICY_OWNER_KEY: owner,
+            })
+        member_router = mock.Mock(
+            uuid='member-router-uuid',
+            policies=[policy_row],
+            static_routes=[
+                mock.Mock(ip_prefix='10.22.33.0/24',
+                          nexthop='172.31.250.2')])
+        member_router.name = 'neutron-member-router'
+        self.ovn_lb.name = self.loadbalancer_id
+        self.ovn_lb.external_ids[ovn_const.LB_EXT_IDS_LR_REF_KEY] = (
+            f'neutron-vip-router,{member_router.name}')
+        command = self.helper.ovn_nbdb_api.db_set.return_value
+
+        self.helper._cross_router_member_policy(
+            self.member, self.ovn_lb, member_router)
+
+        self.helper.ovn_nbdb_api.db_set.assert_called_once_with(
+            'Logical_Router_Policy', policy_row.uuid,
+            ('external_ids', {
+                ovn_const.LB_RETURN_POLICY_OWNER_KEY:
+                    ','.join(sorted([
+                        owner,
+                        f'{self.loadbalancer_id}:{self.member_id}',
+                    ])),
+            }))
+        command.execute.assert_called_once_with(check_error=True)
+        self.helper.ovn_nbdb_api.lr_policy_add.assert_not_called()
+
+    def test_cross_router_member_policy_refuses_unmanaged_collision(self):
+        match = (f'ip4.src == {self.member_address} && '
+                 f'tcp.src == {self.member_port}')
+        policy_row = mock.Mock(
+            priority=ovn_const.LB_RETURN_POLICY_PRIORITY,
+            match=match,
+            action='reroute',
+            nexthops=['172.31.250.2'],
+            external_ids={})
+        member_router = mock.Mock(
+            policies=[policy_row],
+            static_routes=[
+                mock.Mock(ip_prefix='10.22.33.0/24',
+                          nexthop='172.31.250.2')])
+        member_router.name = 'neutron-member-router'
+        self.ovn_lb.external_ids[ovn_const.LB_EXT_IDS_LR_REF_KEY] = (
+            f'neutron-vip-router,{member_router.name}')
+
+        self.assertRaises(
+            exceptions.DriverError,
+            self.helper._cross_router_member_policy,
+            self.member, self.ovn_lb, member_router)
+
+    def test_cross_router_member_policy_ignores_default_route(self):
+        member_router = mock.Mock(
+            policies=[],
+            static_routes=[
+                mock.Mock(ip_prefix='0.0.0.0/0',
+                          nexthop='192.0.2.1')])
+        member_router.name = 'neutron-member-router'
+        self.ovn_lb.external_ids[ovn_const.LB_EXT_IDS_LR_REF_KEY] = (
+            f'neutron-vip-router,{member_router.name}')
+
+        self.helper._cross_router_member_policy(
+            self.member, self.ovn_lb, member_router)
+
+        self.helper.ovn_nbdb_api.lr_policy_add.assert_not_called()
+
     def test_member_update(self):
         status = self.helper.member_update([self.member])
         self.assertEqual(status['loadbalancers'][0]['provisioning_status'],
