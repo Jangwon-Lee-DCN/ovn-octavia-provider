@@ -15,6 +15,11 @@ and OVN.
 * IRC: #openstack-neutron on OFTC.
 * Docs: https://docs.openstack.org/ovn-octavia-provider/latest
 
+This repository is a downstream fork. The local cross-router load-balancer
+return-path behavior, verification evidence, and cleanup contract are documented
+in `CROSS_ROUTER_LB.md <CROSS_ROUTER_LB.md>`_. Upstream documentation and release
+notes are intentionally retained unchanged and do not describe that patch.
+
 Team and repository tags
 ------------------------
 
